@@ -24,18 +24,39 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "es-ES-AlvaroNeural")
 GAP = 0.07          # (ya no se usa; voz continua)
 FONT = "DejaVu Sans"
 HANDLE = os.environ.get("CHANNEL_HANDLE", "").strip()  # tu marca en pantalla (vacío = sin marca)
+VOICE_VOL = os.environ.get("VOICE_VOL", "1.0")  # volumen de la voz: 1.0 = normal; 0.8 = más bajo/tranquilo
 
 def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.stderr.write("CMD FAIL: " + " ".join(cmd[:6]) + "...\n" + r.stderr[-1500:] + "\n")
-        raise SystemExit(1)
+        # RuntimeError (no SystemExit) para que quien llama pueda capturarlo y
+        # tirar del plan B (p.ej. fondo de reserva) en vez de tumbar todo el proceso.
+        raise RuntimeError("ffmpeg/cmd falló: " + " ".join(cmd[:3]))
     return r
 
 def dur_of(path):
     r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
                         "-of","csv=p=0", path], capture_output=True, text=True)
-    return float(r.stdout.strip())
+    try:
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+def _valid_video(path, min_dur=0.4):
+    """True solo si el archivo existe, tiene stream de vídeo y dura lo suficiente.
+    Evita usar clips descargados a medias/corruptos (causa de vídeos sin imagen)."""
+    try:
+        if not (os.path.exists(path) and os.path.getsize(path) > 10000):
+            return False
+        r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0",
+                            "-show_entries","stream=codec_type","-of","csv=p=0", path],
+                           capture_output=True, text=True)
+        if "video" not in r.stdout:
+            return False
+        return dur_of(path) >= min_dur
+    except Exception:
+        return False
 
 # ---------- TTS ----------
 def synth_espeak(text, out_wav):
@@ -73,8 +94,81 @@ def synth_edge_full(text, out_wav):
     os.remove(tmp_mp3)
     return words
 
+def synth_eleven_full(text, out_wav):
+    """Locucion premium con ElevenLabs + tiempos por palabra (endpoint
+    with-timestamps). Devuelve lista [(inicio_s, duracion_s, palabra), ...],
+    EXACTAMENTE el mismo formato que synth_edge_full, para que los subtitulos
+    palabra por palabra sigan sincronizados sin tocar el resto del codigo."""
+    import base64
+    key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    voice = os.environ.get("ELEVEN_VOICE_ID", "").strip()
+    if not key:
+        raise RuntimeError("falta ELEVENLABS_API_KEY")
+    if not voice:
+        raise RuntimeError("falta ELEVEN_VOICE_ID")
+    model = os.environ.get("ELEVEN_MODEL", "eleven_flash_v2_5")
+    fmt = os.environ.get("ELEVEN_FORMAT", "mp3_44100_128")
+    payload = {"text": text, "model_id": model}
+    lang = os.environ.get("ELEVEN_LANG", "").strip()      # opcional: "es" fuerza idioma
+    if lang:
+        payload["language_code"] = lang
+    url = ("https://api.elevenlabs.io/v1/text-to-speech/"
+           + voice + "/with-timestamps?output_format=" + fmt)
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"xi-api-key": key,
+                                          "Content-Type": "application/json",
+                                          "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    b64 = data.get("audio_base64") or data.get("audio")
+    if not b64:
+        raise RuntimeError("respuesta de ElevenLabs sin audio")
+    tmp_mp3 = out_wav + ".mp3"
+    with open(tmp_mp3, "wb") as f:
+        f.write(base64.b64decode(b64))
+    run(["ffmpeg","-y","-loglevel","error","-i",tmp_mp3,"-ar","44100","-ac","2",out_wav])
+    os.remove(tmp_mp3)
+    # Reconstruye tiempos por PALABRA a partir del alineado por CARACTER
+    al = data.get("alignment") or data.get("normalized_alignment") or {}
+    chars = al.get("characters") or []
+    starts = al.get("character_start_times_seconds") or []
+    ends = al.get("character_end_times_seconds") or []
+    words = []
+    cur = ""; w_start = None; w_end = 0.0
+    for i, ch in enumerate(chars):
+        st = starts[i] if i < len(starts) else w_end
+        en = ends[i] if i < len(ends) else st
+        if ch.isspace():
+            if cur:
+                s0 = w_start if w_start is not None else 0.0
+                words.append((s0, max(0.01, w_end - s0), cur)); cur = ""; w_start = None
+        else:
+            if w_start is None:
+                w_start = st
+            cur += ch; w_end = en
+    if cur:
+        s0 = w_start if w_start is not None else 0.0
+        words.append((s0, max(0.01, w_end - s0), cur))
+    return words
+
+def synth_full(text, out_wav):
+    """Locucion completa de una vez + tiempos de palabra. Usa ElevenLabs si
+    esta configurado (TTS_ENGINE=eleven y hay API key) y CAE a edge-tts si algo
+    falla, para no perder nunca el video del dia."""
+    if TTS_ENGINE == "eleven" and os.environ.get("ELEVENLABS_API_KEY"):
+        try:
+            w = synth_eleven_full(text, out_wav)
+            sys.stderr.write("[tts] voz: ElevenLabs (" +
+                             os.environ.get("ELEVEN_MODEL", "eleven_flash_v2_5") + ")\n")
+            return w
+        except Exception as e:
+            sys.stderr.write("[tts] ElevenLabs fallo (%s); uso edge-tts.\n" % e)
+    return synth_edge_full(text, out_wav)
+
 def synth(text, out_wav):
-    if TTS_ENGINE == "edge":
+    # 'eleven' usa la locucion premium en build_audio; si por lo que sea se llega
+    # aqui (reparto frase a frase), usamos edge (existe en el runner), NUNCA espeak.
+    if TTS_ENGINE in ("edge", "eleven"):
         synth_edge(text, out_wav)
     else:
         synth_espeak(text, out_wav)
@@ -182,7 +276,7 @@ def _pexels_clips(query, n, workdir):
             try:
                 with urllib.request.urlopen(files[0]["link"], timeout=20) as r, open(dst, "wb") as f:
                     f.write(r.read())
-                if os.path.getsize(dst) > 10000:
+                if _valid_video(dst):
                     out.append(dst)
             except Exception:
                 pass
@@ -218,7 +312,7 @@ def _pixabay_clips(query, n, workdir):
                 rq = urllib.request.Request(f["url"], headers={"User-Agent": "canal-bot/1.0"})
                 with urllib.request.urlopen(rq, timeout=20) as r, open(dst, "wb") as fo:
                     fo.write(r.read())
-                if os.path.getsize(dst) > 10000:
+                if _valid_video(dst):
                     out.append(dst)
             except Exception:
                 pass
@@ -264,16 +358,83 @@ def _groups(nlines, n):
         idx += cnt
     return [g for g in gs if g]
 
+def _falai_clip(prompt, workdir, idx):
+    """Genera UN clip cinematografico con IA (Kling via fal.ai). Devuelve la ruta
+    del mp4 o None. Si falla por lo que sea, devuelve None y el motor usa stock."""
+    key = os.environ.get("FAL_KEY", "").strip()
+    if not key or not prompt:
+        return None
+    import time
+    model = os.environ.get("FAL_MODEL", "fal-ai/kling-video/v2.5-turbo/pro/text-to-video")
+    dur = os.environ.get("FAL_DURATION", "5")
+    style = os.environ.get("FAL_STYLE", "cinematic, slow motion, highly detailed, soft natural light")
+    full = (prompt + ", " + style).strip(", ")
+    try:
+        body = json.dumps({"prompt": full, "duration": str(dur), "aspect_ratio": "9:16"}).encode()
+        req = urllib.request.Request("https://queue.fal.run/" + model, data=body,
+              headers={"Authorization": "Key " + key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            sub = json.loads(r.read().decode())
+        status_url = sub.get("status_url"); response_url = sub.get("response_url")
+        if not status_url or not response_url:
+            return None
+        for _ in range(70):                      # espera hasta ~6 min
+            rq = urllib.request.Request(status_url, headers={"Authorization": "Key " + key})
+            with urllib.request.urlopen(rq, timeout=30) as r:
+                st = json.loads(r.read().decode())
+            s = st.get("status")
+            if s == "COMPLETED":
+                break
+            if s in ("FAILED", "ERROR", "CANCELED"):
+                sys.stderr.write(f"[bg] fal.ai estado {s}; uso stock.\n"); return None
+            time.sleep(5)
+        else:
+            sys.stderr.write("[bg] fal.ai tardo demasiado; uso stock.\n"); return None
+        rq = urllib.request.Request(response_url, headers={"Authorization": "Key " + key})
+        with urllib.request.urlopen(rq, timeout=60) as r:
+            res = json.loads(r.read().decode())
+        vid = ((res.get("video") or {}).get("url")
+               or (res.get("output") or {}).get("url")
+               or (res.get("videos", [{}])[0].get("url") if res.get("videos") else None))
+        if not vid:
+            return None
+        dst = os.path.join(workdir, f"ai_{idx}.mp4")
+        rq2 = urllib.request.Request(vid, headers={"User-Agent": "canal-bot/1.0"})
+        with urllib.request.urlopen(rq2, timeout=180) as r, open(dst, "wb") as f:
+            f.write(r.read())
+        if _valid_video(dst):
+            print(f"[bg] clip IA (Kling) para: {prompt[:40]}")
+            return dst
+        return None
+    except Exception as e:
+        sys.stderr.write(f"[bg] fal.ai fallo ({e}); uso stock.\n")
+        return None
+
 def build_background(script, total, workdir, spans):
-    """Fondo dinámico: un clip real por IDEA, con push-in. None si no hay clips."""
+    """Fondo dinámico: un clip por IDEA, con push-in. Usa metraje IA (Kling) para los
+    primeros AI_CLIPS 'hero' si hay FAL_KEY, y stock para el resto. None si no hay clips."""
     srcs = []
     blist = script.get("broll_list")
-    if blist and not os.environ.get("LOCAL_BROLL_DIR") and (
-            os.environ.get("PEXELS_API_KEY") or os.environ.get("PIXABAY_API_KEY")):
-        for q in blist:
-            cs = _clips_for_query(q, 1, workdir)
-            if cs:
-                srcs.append(cs[0])
+    try:
+        ai_max = int(os.environ.get("AI_CLIPS", "0"))
+    except ValueError:
+        ai_max = 0
+    have_stock = bool(os.environ.get("PEXELS_API_KEY") or os.environ.get("PIXABAY_API_KEY"))
+    have_ai = bool(os.environ.get("FAL_KEY"))
+    ai_done = 0
+    if blist and not os.environ.get("LOCAL_BROLL_DIR") and (have_stock or have_ai):
+        for i, q in enumerate(blist):
+            clip = None
+            if have_ai and ai_done < ai_max:
+                clip = _falai_clip(q, workdir, i)
+                if clip:
+                    ai_done += 1
+            if not clip and have_stock:
+                cs = _clips_for_query(q, 1, workdir)
+                if cs:
+                    clip = cs[0]
+            if clip:
+                srcs.append(clip)
     if not srcs:
         srcs = _gather_clips(script, workdir)
     if not srcs:
@@ -296,7 +457,7 @@ def build_background(script, total, workdir, spans):
         out = os.path.join(workdir, f"bgseg_{k}.mp4")
         try:
             _norm_clip(srcs[k], dur + 0.1, out)
-            if os.path.getsize(out) > 5000:
+            if _valid_video(out, 0.3):
                 segs.append(out)
         except Exception as e:
             sys.stderr.write(f"[bg] clip {k} no sirvió ({e})\n")
@@ -309,15 +470,19 @@ def build_background(script, total, workdir, spans):
     bgv = os.path.join(workdir, "bg.mp4")
     try:
         run(["ffmpeg","-y","-loglevel","error","-f","concat","-safe","0","-i",lst,"-c","copy", bgv])
-        return bgv
     except Exception as e:
         sys.stderr.write(f"[bg] concat falló ({e})\n")
         return None
+    # Verificación final: si el fondo montado no es un vídeo válido, usar degradado.
+    if not _valid_video(bgv, 1.0):
+        sys.stderr.write("[bg] bg.mp4 no válido; uso degradado.\n")
+        return None
+    return bgv
 
 # ---------- Audio ----------
 def build_audio(lines, workdir):
-    # edge: una sola locución continua (fluida) + tiempos de palabra reales
-    if TTS_ENGINE == "edge":
+    # edge/eleven: una sola locución continua (fluida) + tiempos de palabra reales
+    if TTS_ENGINE in ("edge", "eleven"):
         try:
             return _audio_oneshot(lines, workdir)
         except Exception as e:
@@ -327,7 +492,7 @@ def build_audio(lines, workdir):
 def _audio_oneshot(lines, workdir):
     full = os.path.join(workdir, "full.wav")
     text = _tts_join(lines)
-    words = synth_edge_full(text, full)
+    words = synth_full(text, full)
     total = dur_of(full)
     if total <= 0:
         raise RuntimeError("audio vacío")
@@ -423,20 +588,26 @@ def build_video(script, out_path, workdir):
         if tracks:
             import datetime
             yday = datetime.date.today().timetuple().tm_yday
-            run_n = int(os.environ.get("GITHUB_RUN_NUMBER", "0") or "0")
-            music_file = tracks[(yday + run_n) % len(tracks)]   # va alternando
+            music_file = tracks[yday % len(tracks)]   # rota 1 por día (recorre todas)
+
+    # ---- COLA FINAL: la última frase respira y la música se apaga con suavidad ----
+    TAIL = 0.9
+    final_dur = total + TAIL
+    vfade = f"fade=t=out:st={max(0.0, final_dur-0.6):.2f}:d=0.6"
 
     ass_esc = ass.replace("\\","/").replace(":","\\:")
     if bgv:
         inputs = ["-i", bgv]
+        # tpad: congela el último fotograma durante la cola (el fondo nunca se queda corto)
         base_vf = ("eq=brightness=-0.03:saturation=1.18:contrast=1.05,"
                    "drawbox=0:0:1080:1920:color=black@0.28:t=fill,"
-                   f"subtitles='{ass_esc}',setsar=1")
+                   f"tpad=stop_mode=clone:stop_duration={TAIL+1.0:.2f},"
+                   f"subtitles='{ass_esc}',{vfade},setsar=1")
     else:
         inputs = ["-loop","1","-i", grad]
         base_vf = (f"scale=1188:2112,zoompan=z='min(1.0+0.00045*in,1.12)':d=1:"
                    f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,"
-                   f"subtitles='{ass_esc}',setsar=1")
+                   f"subtitles='{ass_esc}',{vfade},setsar=1")
     if has_chart:
         inputs += ["-loop","1","-i",chart_path]
     inputs += ["-i", full_wav]
@@ -447,9 +618,11 @@ def build_video(script, out_path, workdir):
     if has_chart:
         cl = script.get("chart_lines")
         if cl:
-            i0 = max(0, min(int(cl[0]), len(events)-1))
-            i1 = max(0, min(int(cl[1]), len(events)-1))
-            cs, ce = events[i0][0], events[i1][1]
+            # chart_lines son índices de LÍNEA -> usar spans (por línea), no events
+            # (que ahora van por palabra). Así la gráfica sale en el momento correcto.
+            i0 = max(0, min(int(cl[0]), len(spans)-1))
+            i1 = max(0, min(int(cl[1]), len(spans)-1))
+            cs, ce = spans[i0][0], spans[i1][1]
         else:
             c = script.get("chart_window",[0,total]); cs, ce = float(c[0]), float(c[1])
         fc += (f"[1:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
@@ -460,24 +633,27 @@ def build_video(script, out_path, workdir):
         fc += "[base]null[v]"
 
     ai_voice = 2 if has_chart else 1
+    # La voz se alarga con silencio hasta final_dur; la música (en bucle) rellena
+    # la cola y TODO se funde suavemente al final (nada de corte en seco).
     if music_file:
         ai_mus = ai_voice + 1
-        # voz normalizada a nivel pro (-16 LUFS) y música de fondo suave
-        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11[vo];"
+        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,volume={VOICE_VOL},apad=whole_dur={final_dur:.2f}[vo];"
                f"[{ai_mus}:a]volume=0.09[mu];"
-               f"[vo][mu]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
+               f"[vo][mu]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+               f"afade=t=out:st={total:.2f}:d={TAIL:.2f}[a]")
         amap = "[a]"
     else:
-        fc += f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11[a]"
+        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,volume={VOICE_VOL},apad=whole_dur={final_dur:.2f},"
+               f"afade=t=out:st={total:.2f}:d={TAIL:.2f}[a]")
         amap = "[a]"
 
     cmd = ["ffmpeg","-y","-loglevel","error"] + inputs + [
         "-filter_complex",fc,"-map","[v]","-map",amap,
-        "-t",f"{total:.2f}","-r","30",
+        "-t",f"{final_dur:.2f}","-r","30",
         "-c:v","libx264","-preset","medium","-crf","18","-pix_fmt","yuv420p",
         "-c:a","aac","-b:a","192k","-movflags","+faststart", out_path]
     run(cmd)
-    return total
+    return final_dur
 
 def pick_script(scripts, arg=None):
     if arg:
@@ -486,8 +662,10 @@ def pick_script(scripts, arg=None):
                 return s
     import datetime
     yday = datetime.date.today().timetuple().tm_yday
-    run = int(os.environ.get("GITHUB_RUN_NUMBER", "0") or "0")
-    return scripts[(yday + run) % len(scripts)]
+    # avanza de 1 en 1 por día -> recorre TODO el banco sin repetir durante
+    # 'len' días (antes sumaba GITHUB_RUN_NUMBER y saltaba de 2 en 2, así que
+    # solo usaba la mitad del banco y repetía cada pocos días).
+    return scripts[yday % len(scripts)]
 
 def main():
     with open(os.path.join(BASE,"scripts.json"),encoding="utf-8") as f:

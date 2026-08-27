@@ -5,64 +5,57 @@ Se activa solo si existe GEMINI_API_KEY. Si falla algo, devuelve None
 y el sistema usa el banco de guiones (scripts.json) como reserva.
 Devuelve un dict con el mismo formato que usa generate.py.
 """
-import os, sys, json, datetime, urllib.request
+import os, sys, json, datetime, random, urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-BGS = ["blue", "green", "orange", "purple", "teal", "red"]
-
-# Temas y formatos que rotan por dia para no repetir (anti "contenido inautentico")
-TEMAS = [
-    "la tecnica de la sentadilla",
-    "la importancia de la proteina",
-    "el descanso y el sueno para crecer",
-    "el sobreentrenamiento",
-    "el mito de sudar para adelgazar",
-    "cardio o pesas",
-    "la progresion de cargas",
-    "la hidratacion en el entreno",
-    "el mito de tonificar",
-    "la constancia por encima de todo",
-    "que son las agujetas",
-    "la respiracion en el esfuerzo",
-    "el deficit calorico",
-    "el mito de los abdominales a diario",
-    "calentar antes de entrenar",
-    "estiramientos y movilidad",
-    "el volumen de entrenamiento",
-    "la conexion mente-musculo",
-    "como no perder la motivacion",
-    "cuanto descansar entre series"
+MODEL = os.environ.get("GEMINI_MODEL", "").strip()  # vacio = autodetectar modelo valido
+# Candidatos por si ListModels no responde (de mas nuevo a mas compatible).
+_MODEL_CANDIDATES = [
+    "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash",
+    "gemini-2.5-flash-lite", "gemini-2.0-flash-001", "gemini-1.5-flash",
 ]
+BGS = ["blue", "green", "orange", "purple", "teal", "red"]
+# ZONAS/OBJETIVOS que rotan por dia (se usan como "a evitar hoy" para forzar variedad)
+TEMAS = [
+    "la espalda y la postura", "el abdomen y el core", "las piernas", "los brazos",
+    "los gluteos", "la movilidad", "el cardio en casa", "los estiramientos",
+    "el dolor de cuello y hombros", "el calentamiento", "la fuerza sin material",
+    "el equilibrio", "la resistencia", "la flexibilidad", "el suelo pelvico",
+]
+# ESTILOS que se intercalan cada dia (concreto y guardable, no charla)
 FORMATOS = [
-    "mito vs realidad", "un dato sorprendente con ejemplo numerico",
-    "el error comun que casi todos cometen", "top 3 rapido",
-    "esto no te lo cuentan", "comparativa antes vs despues",
-    "una pregunta que pica la curiosidad y su respuesta",
+    "el mejor ejercicio para una zona concreta, explicado para hacerlo bien",
+    "una mini rutina de 3 movimientos, guardable",
+    "el fallo de tecnica que arruina el progreso (y como corregirlo)",
+    "el ejercicio para aliviar un dolor comun, con cuidado",
+    "el mito del gym desmontado con criterio",
+    "el gesto pequeno que multiplica tus resultados",
 ]
 
 SCHEMA_INSTRUCCION = """
 Devuelve UNICAMENTE un JSON valido (sin texto alrededor) con esta forma exacta:
 {
-  "title": "titulo honesto y con gancho, max 90 caracteres, puede llevar 1 emoji y #shorts",
-  "description": "1-2 frases de valor + CTA. Anade al final: 'Consejo general, no medico.'",
+  "title": "titulo concreto y util, max 90 caracteres, puede llevar 1 emoji y #shorts",
+  "description": "1-2 frases claras + invitar a guardar. Anade al final: 'Escucha a tu cuerpo; ante dolor o lesion, consulta a un profesional.'",
   "hashtags": ["Shorts", "gym", "fitness", "entrenamiento"],  // 3 a 5, sin '#', el primero SIEMPRE 'Shorts'
-  "bg": "uno de: blue, green, orange, purple, teal, red",
-  "broll": "2-4 palabras EN INGLES para metraje de archivo (ej: 'gym workout fitness')",
+  "bg": "uno de: blue, teal, orange, red (tonos energicos)",
+  "broll": "2-4 palabras EN INGLES del ejercicio/accion (ej: 'workout core exercise')",
+  "broll_list": ["3 o 4 planos de ejercicio GENERICOS EN INGLES, en orden (ej: 'plank exercise floor', 'dumbbell workout gym', 'stretching cooldown mat')"],
   "ai_disclosure": false,
   "lines": [
-    {"voice": "frase corta que se narra (con numeros en palabras: 'cien euros', no '100')",
+    {"voice": "frase corta, clara y motivadora (numeros en palabras: 'quince segundos', no '15s')",
      "cap": "subtitulo MUY corto en pantalla (2-4 palabras, puede llevar cifras)"}
   ]
 }
-Reglas del guion:
-- Entre 10 y 13 lineas. Cada 'voice' es una frase corta y natural (el video debe durar 20-40 s).
-- La PRIMERA linea es el gancho: sin saludos ni intro, engancha en el primer segundo.
-- La ULTIMA linea es el CTA: invita a seguir ("Sigueme para entrenar mejor cada dia") o a comentar.
-- 'cap' nunca lleva emojis (la fuente no los dibuja). 'voice' escribe los numeros con letras.
-- Espanol, tono energico y directo, practico. Frases cortas que activen.
+Reglas del guion (formato 'El ejercicio para ___'):
+- Entre 8 y 11 lineas. Da algo CONCRETO y util (un ejercicio, una mini rutina) bien explicado (el video dura 30-45 s).
+- ESPECIFICO Y GUARDABLE: nada de charla generica ni 'motivacion vacia'. Que sirva y se quiera guardar.
+- SEGURIDAD: tecnica correcta, sin promesas milagro; ante dolor o lesion, remitir a un profesional. Nada de consejo medico como verdad.
+- APERTURA (linea 1, VARIADA cada dia, nunca identica a la de ayer): una promesa concreta. Ej: 'El mejor ejercicio para una espalda sin dolor.'
+- CIERRE (ultima linea, VARIADO cada dia): invita a guardarlo. Ej: 'Guardalo para tu proximo entreno.'
+- Tono de coach cercano y con energia. 'cap' sin emojis. 'voice' con numeros en letras.
+- Espanol de Espana.
 """
-
 def _run_seed():
     try:
         return int(os.environ.get("GITHUB_RUN_NUMBER", "0"))
@@ -73,8 +66,42 @@ def _pick(lst, salt=0):
     y = datetime.date.today().timetuple().tm_yday
     return lst[(y + _run_seed() + salt) % len(lst)]
 
-def _call_gemini(prompt, key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}"
+def _list_models(key):
+    """Pregunta a Google que modelos existen de verdad para esta clave."""
+    try:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models"
+               f"?key={key}&pageSize=200")
+        with urllib.request.urlopen(url, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        out = []
+        for m in data.get("models", []):
+            if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                out.append(m.get("name", "").replace("models/", ""))
+        return out
+    except Exception:
+        return []
+
+def _model_order(key):
+    """Orden a probar: modelo forzado por env -> candidatos -> los reales
+    de la cuenta (priorizando 'flash')."""
+    order = []
+    if MODEL:
+        order.append(MODEL)
+    for m in _MODEL_CANDIDATES:
+        if m not in order:
+            order.append(m)
+    disc = _list_models(key)
+    for m in disc:
+        if "flash" in m and m not in order:
+            order.append(m)
+    for m in disc:
+        if m not in order:
+            order.append(m)
+    return order
+
+def _post_generate(model, prompt, key):
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={key}")
     body = json.dumps({
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.95, "responseMimeType": "application/json"},
@@ -83,6 +110,19 @@ def _call_gemini(prompt, key):
     with urllib.request.urlopen(req, timeout=60) as r:
         data = json.loads(r.read().decode())
     return data["candidates"][0]["content"]["parts"][0]["text"]
+
+def _call_gemini(prompt, key):
+    """Prueba varios modelos y usa el primero que responda (sobrevive a que
+    Google jubile un modelo). Solo falla si NINGUNO funciona."""
+    last = None
+    for model in _model_order(key):
+        try:
+            txt = _post_generate(model, prompt, key)
+            sys.stderr.write(f"[ai] modelo usado: {model}\n")
+            return txt
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"ningun modelo Gemini respondio: {last}")
 
 def _validate(s):
     assert isinstance(s.get("lines"), list) and 6 <= len(s["lines"]) <= 16, "lineas fuera de rango"
@@ -97,7 +137,7 @@ def _validate(s):
         hs = ["Shorts"] + [h for h in hs if h.lower() != "shorts"]
     s["hashtags"] = hs[:5]
     assert s.get("title"), "sin titulo"
-    s.setdefault("description", "Tip de gym en 30 segundos. Consejo general, no medico. Sigueme para entrenar mejor.")
+    s.setdefault("description", "El ejercicio que te faltaba. Guardalo para tu proximo entreno. Ante dolor o lesion, consulta a un profesional.")
     s["id"] = "ia-" + datetime.date.today().isoformat()
     s.pop("chart", None)
     return s
@@ -109,16 +149,19 @@ def generate():
     try:
         master = open(os.path.join(BASE, "PROMPT-MAESTRO.md"), encoding="utf-8").read()
     except Exception:
-        master = "Eres un productor experto de YouTube Shorts de fitness y gimnasio en espanol."
-    tema, formato = _pick(TEMAS), _pick(FORMATOS, salt=2)
+        master = "Eres un coach de fitness de YouTube Shorts en espanol que da ejercicios concretos, seguros y guardables, con energia."
+    formato = random.choice(FORMATOS)
+    hoy = datetime.date.today().isoformat()
+    # Usamos TEMAS solo como "lo obvio a EVITAR", para empujar novedad
+    evitar = ", ".join(random.sample(TEMAS, min(6, len(TEMAS)))) if TEMAS else ""
     seed = _run_seed()
     prompt = (master
-              + "\n\n---\nTAREA DE HOY:\n"
-              + f"Crea el Short de hoy sobre: {tema}. Formato: {formato}.\n"
-              + f"Dale un ENFOQUE ORIGINAL y distinto a cualquier video anterior "
-              + f"(variacion #{seed}): cambia el gancho, el ejemplo y las frases exactas. "
-              + "No repitas estructuras ni frases hechas.\n"
-              + "Cumple TODAS las reglas de arriba (cumplimiento primero, luego viralidad).\n"
+              + f"\n\n---\nTAREA DE HOY ({hoy}):\n"
+              + "DA algo CONCRETO y util de entrenamiento para hoy (un ejercicio o mini rutina), "
+                "bien explicado y guardable. Elige tu mismo la zona u objetivo.\n"
+              + (f"Para forzar variedad, HOY evita estas zonas (elige otra): {evitar}.\n" if evitar else "")
+              + f"Presentalo con este ESTILO de hoy: {formato}.\n"
+              + "Apertura y cierre VARIADOS (nunca los de ayer); titulo y descripcion UNICOS de hoy. Que HOY se note claramente distinto a cualquier dia anterior. Concreto y util, NO charla generica.\n"
               + SCHEMA_INSTRUCCION)
     try:
         raw = _call_gemini(prompt, key)
